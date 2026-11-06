@@ -1,5 +1,21 @@
+"""基于作者订阅地址生成 live.txt。
+
+规则：
+  1. 拉取作者最新 live.txt（失败则退回仓库里现有的 live.txt）；
+  2. 分组名去掉国旗/表情前缀（🇨🇳 等）；
+  3. 删除河南地方、电影在线、影音剧场三个分组，以及所有河南频道；
+  4. 江苏本地台单独作为「江苏地方」分组放到文件最前面；
+  5. 仅对 IPV4线路 分组内的 CCTV 频道做处理：名字去掉横线和中文后缀（CCTV-1 → CCTV1、CCTV1综合 → CCTV1），
+     并按台号（CCTV1、CCTV2、CCTV3…）排在 IPV4线路 分组最前面；组播线路保持原样；
+  6. 校验通过后覆盖写入 live.txt。
+
+用法：
+  python build_live.py            # 先拉作者地址，拉不到用本地
+  python build_live.py --offline  # 不联网，只用本地 live.txt
+"""
 import io
 import os
+import re
 import sys
 import urllib.request
 
@@ -12,8 +28,10 @@ UPSTREAM_URLS = [
     'https://raw.githubusercontent.com/Supprise0901/TVBox_live/main/live.txt',
 ]
 
-TARGET_GROUP = '江苏地方'
-SOURCE_GROUP = '组播线路'
+TARGET_GROUP = '江苏地方'      # 江苏本地台分组（放最前）
+IPV4_GROUP = 'IPV4线路'        # 需要整理 CCTV 的分组
+SOURCE_GROUP = '组播线路'      # 江苏频道从这里取源
+LEGACY_CCTV_GROUP = '央视频道'  # 早期版本生成过的分组，若存在则并回 IPV4线路
 DROP_GROUPS = ('河南地方', '电影在线', '影音剧场')
 DROP_CHANNEL_PREFIX = '河南'
 MIN_CHANNELS = 10  # 江苏地方至少要有这么多台，否则视为上游异常，不覆盖文件
@@ -43,6 +61,35 @@ MAPPING = [
     ('溧水新闻综合', '溧水新闻综合'),
 ]
 
+# 分组名前面的国旗/表情前缀，如 🇨🇳、🛰️
+GROUP_PREFIX = re.compile(r'^[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200d\s]+')
+
+
+CCTV_PREFIX = re.compile(r'^CCTV\s*[\-－]?\s*(\d+)(\+?)', re.IGNORECASE)
+
+
+def normalize_cctv(name):
+    """CCTV 频道名归一：CCTV-1 → CCTV1、CCTV1综合 → CCTV1、CCTV5+体育赛事 → CCTV5+。"""
+    name = name.strip()
+    m = CCTV_PREFIX.match(name)
+    if m:
+        return 'CCTV%s%s' % (m.group(1), m.group(2))
+    if name.upper().startswith('CCTV'):
+        return re.sub(r'^CCTV[\s\-－]+', 'CCTV', name, flags=re.IGNORECASE)
+    return name
+
+
+def cctv_key(name):
+    """排序键：CCTV1 → CCTV2 → … → CCTV17，带后缀的排在主台之后。"""
+    m = re.match(r'^CCTV(\d+)(.*)$', name, flags=re.IGNORECASE)
+    if m:
+        return (0, int(m.group(1)), m.group(2))
+    return (1, 9999, name)
+
+
+def line_name(line):
+    return line.split(',', 1)[0].strip() if ',' in line else line.strip()
+
 
 def fetch_upstream():
     """拉取作者最新 live.txt，全部失败返回 None。"""
@@ -65,36 +112,39 @@ def read_lines(path):
         return []
     with io.open(path, 'r', encoding='utf-8-sig', newline='') as f:
         raw = f.read()
-    return [l for l in raw.replace('\r\n', '\n').split('\n')]
+    return raw.replace('\r\n', '\n').split('\n')
 
 
-def drop_group(lines, keyword):
-    """删除分组名包含 keyword 的整个分组（分组头 + 组内频道）。"""
-    out, i, dropped = [], 0, 0
-    while i < len(lines):
-        if '#genre#' in lines[i] and keyword in lines[i]:
-            i += 1
-            while i < len(lines) and '#genre#' not in lines[i]:
-                i += 1
-                dropped += 1
-            continue
-        out.append(lines[i])
-        i += 1
-    return out, dropped
-
-
-def group_range(lines, keyword):
-    """返回分组内频道的行号区间 [start, end)，找不到返回 (0, 0)。"""
-    start = end = 0
-    for idx, line in enumerate(lines):
+def split_blocks(lines):
+    """把文件切成 [(分组头, [频道行]), ...]，分组头为空串表示文件开头的散行。"""
+    blocks = []
+    for line in lines:
         if '#genre#' in line:
-            if start and not end:
-                end = idx
-            if keyword in line:
-                start = idx + 1
-    if start and not end:
-        end = len(lines)
-    return (start, end) if start else (0, 0)
+            blocks.append([line, []])
+        elif blocks:
+            blocks[-1][1].append(line)
+        else:
+            blocks.append(['', [line]])
+    return blocks
+
+
+def find_block(blocks, keyword):
+    for block in blocks:
+        if block[0] and keyword in block[0]:
+            return block
+    return None
+
+
+def block_pairs(block):
+    """取出分组内的 (频道名, 链接)。"""
+    pairs = []
+    if not block:
+        return pairs
+    for line in block[1]:
+        if ',' in line:
+            name, url = line.split(',', 1)
+            pairs.append((name.strip(), url))
+    return pairs
 
 
 def build(base_lines, fallback=None):
@@ -102,56 +152,114 @@ def build(base_lines, fallback=None):
     fallback = fallback or {}
     lines = [l for l in base_lines if l.strip()]
 
-    # 1. 删除旧江苏地方分组（其链接留作兜底），再删除指定分组与河南频道
-    start, end = group_range(lines, TARGET_GROUP)
-    old = {}
-    for line in lines[start:end]:
-        if ',' in line:
-            name, url = line.split(',', 1)
-            old[name.strip()] = url
-    old.update(fallback)
-    lines, n_target = drop_group(lines, TARGET_GROUP)
+    # 0. 分组名去掉国旗/表情前缀（频道名只整理 IPV4线路 里的 CCTV，其它分组保持原样）
+    fixed = []
+    for line in lines:
+        if '#genre#' in line:
+            fixed.append(GROUP_PREFIX.sub('', line.split(',', 1)[0]).strip() + ',#genre#')
+        else:
+            fixed.append(line)
+    blocks = split_blocks(fixed)
 
-    dropped = {}
-    for keyword in DROP_GROUPS:
-        lines, n = drop_group(lines, keyword)
-        if n:
-            dropped[keyword] = n
-    henan = [l for l in lines if l.startswith(DROP_CHANNEL_PREFIX)]
-    lines = [l for l in lines if not l.startswith(DROP_CHANNEL_PREFIX)]
+    # 1. 江苏地方分组：优先用组播线路里的源，取不到再用上一次的链接兜底
+    js_old = dict(block_pairs(find_block(blocks, TARGET_GROUP)))
+    js_old.update(fallback)
 
-    # 2. 从组播线路取江苏频道（取到后从原分组移走，避免同一个台出现两次）
-    start, end = group_range(lines, SOURCE_GROUP)
     found = {}
-    for line in lines[start:end]:
-        if ',' not in line:
-            continue
-        name, url = line.split(',', 1)
-        name = name.strip()
-        for src_name, _ in MAPPING:
-            if name == src_name and src_name not in found:
-                found[src_name] = url
-                break
+    src_block = find_block(blocks, SOURCE_GROUP)
+    if src_block:
+        for name, url in block_pairs(src_block):
+            for src_name, _ in MAPPING:
+                if name == src_name and src_name not in found:
+                    found[src_name] = url
+                    break
+        moved = set('%s,%s' % (k, v) for k, v in found.items())
+        src_block[1] = [l for l in src_block[1] if l not in moved]
 
-    group, missing = ['🇨🇳%s,#genre#' % TARGET_GROUP], []
+    js_lines, missing = [], []
     for src_name, new_name in MAPPING:
-        url = found.get(src_name) or old.get(new_name)
+        url = found.get(src_name) or js_old.get(new_name)
         if url:
-            group.append(new_name + ',' + url)
+            js_lines.append(new_name + ',' + url)
         else:
             missing.append(new_name)
 
-    moved = set('%s,%s' % (k, v) for k, v in found.items())
-    lines = [l for l in lines if l not in moved]
+    # 2. 删掉旧江苏地方分组、指定分组，以及所有河南频道
+    kept, dropped, leftover_cctv, henan = [], {}, [], 0
+    for block in blocks:
+        head = block[0]
+        if head and TARGET_GROUP in head:
+            continue
+        matched = [k for k in DROP_GROUPS if head and k in head]
+        if matched:
+            dropped[matched[0]] = len(block[1])
+            continue
+        if head and LEGACY_CCTV_GROUP in head:
+            # 旧版本单独拆出来的央视频道，并回 IPV4线路
+            leftover_cctv.extend(block[1])
+            continue
+        kept_lines = []
+        for line in block[1]:
+            if line.startswith(DROP_CHANNEL_PREFIX):
+                henan += 1
+                continue
+            kept_lines.append(line)
+        block[1] = kept_lines
+        kept.append(block)
+
+    iv4 = find_block(kept, IPV4_GROUP)
+    if leftover_cctv:
+        if iv4 is None:
+            iv4 = ['%s,#genre#' % IPV4_GROUP, []]
+            kept.append(iv4)
+        iv4[1].extend(leftover_cctv)
+
+    # 3. 只整理 IPV4线路：CCTV 去掉横线和中文后缀（CCTV1综合 → CCTV1），按台号排在最前
+    cctv_count, renamed = 0, 0
+    if iv4:
+        cctv_lines, others, seen = [], [], set()
+        for line in iv4[1]:
+            if ',' not in line:
+                others.append(line)
+                continue
+            name, url = line.split(',', 1)
+            if name.strip().upper().startswith('CCTV'):
+                new_name = normalize_cctv(name)
+                if new_name != name.strip():
+                    renamed += 1
+                merged = new_name + ',' + url
+                if merged in seen:
+                    continue
+                seen.add(merged)
+                cctv_lines.append(merged)
+                continue
+            others.append(line)
+        cctv_lines.sort(key=lambda l: cctv_key(line_name(l)))
+        iv4[1] = cctv_lines + others
+        cctv_count = len(cctv_lines)
+
+    # 4. 组播线路 放到 IPV4线路 前面（其它分组顺序不变，重复执行结果一致）
+    i_ipv4 = next((i for i, b in enumerate(kept) if b[0] and IPV4_GROUP in b[0]), None)
+    i_src = next((i for i, b in enumerate(kept) if b[0] and SOURCE_GROUP in b[0]), None)
+    if i_ipv4 is not None and i_src is not None and i_ipv4 < i_src:
+        kept[i_ipv4], kept[i_src] = kept[i_src], kept[i_ipv4]
+
+    # 5. 组装：江苏地方在最前
+    out = ['%s,#genre#' % TARGET_GROUP] + js_lines
+    for block in kept:
+        if block[0]:
+            out.append(block[0])
+        out.extend(block[1])
 
     stats = {
-        'old_target': n_target,
         'dropped': dropped,
-        'henan': len(henan),
-        'channels': len(group) - 1,
+        'henan': henan,
+        'renamed': renamed,
+        'channels': len(js_lines),
         'missing': missing,
+        'cctv': cctv_count,
     }
-    return group + lines, stats
+    return out, stats
 
 
 def main():
@@ -159,11 +267,9 @@ def main():
 
     local_lines = read_lines(PATH)
     fallback = {}
-    start, end = group_range(local_lines, TARGET_GROUP)
-    for line in local_lines[start:end]:
-        if ',' in line:
-            name, url = line.split(',', 1)
-            fallback[name.strip()] = url
+    local_block = find_block(split_blocks([l for l in local_lines if l.strip()]), TARGET_GROUP)
+    if local_block:
+        fallback = dict(block_pairs(local_block))
 
     base_lines, source = local_lines, '本地 live.txt'
     if not offline:
@@ -171,7 +277,7 @@ def main():
         if text:
             base_lines, source = text.replace('\r\n', '\n').split('\n'), '作者订阅'
         else:
-            print('地址拉取失败，改用本地 live.txt')
+            print('作者地址拉取失败，改用本地 live.txt')
     if not base_lines:
         raise SystemExit('没有可用的 live.txt 数据')
 
@@ -190,9 +296,10 @@ def main():
         f.write('\r\n'.join(out) + '\r\n')
 
     print('数据来源: %s' % source)
-    print('删除旧江苏地方分组: %s 行' % stats['old_target'])
     print('删除分组: %s' % ('、'.join('%s(%s行)' % (k, v) for k, v in stats['dropped'].items()) or '无'))
     print('其它河南频道: %s 行' % stats['henan'])
+    print('CCTV 改名（去横线/中文后缀）: %s 条' % stats['renamed'])
+    print('IPV4线路 内 CCTV: %s 条（已按台号排序置顶）' % stats['cctv'])
     print('江苏地方: %s 个频道' % stats['channels'])
     if stats['missing']:
         print('缺少可用源: %s' % ', '.join(stats['missing']))
