@@ -8,9 +8,8 @@ on:
       - build_live.py
       - .github/workflows/TV_search.yml
   schedule:
-    # 每 2 小时跑一次（UTC 整点：0 */2 * * *）
-    # 北京时间 = UTC+8，所以对应 08:00、10:00、12:00 … 次日 06:00
-    - cron: '0 */2 * * *'
+    # 每小时整点跑一次（UTC），对应北京时间每小时的第 8 分钟之后
+    - cron: '0 * * * *'
 
 permissions:
   contents: write
