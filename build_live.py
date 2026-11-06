@@ -1,9 +1,16 @@
 import io
 import os
 import sys
+import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PATH = os.path.join(BASE_DIR, 'live.txt')
+
+# 作者订阅地址（ghfast 为国内加速镜像，失败再走 GitHub 原始地址）
+UPSTREAM_URLS = [
+    'https://ghfast.top/raw.githubusercontent.com/Supprise0901/TVBox_live/main/live.txt',
+    'https://raw.githubusercontent.com/Supprise0901/TVBox_live/main/live.txt',
+]
 
 TARGET_GROUP = '江苏地方'
 SOURCE_GROUP = '组播线路'
@@ -35,6 +42,22 @@ MAPPING = [
     ('宜兴新闻综合', '宜兴新闻综合'),
     ('溧水新闻综合', '溧水新闻综合'),
 ]
+
+
+def fetch_upstream():
+    """拉取作者最新 live.txt，全部失败返回 None。"""
+    for url in UPSTREAM_URLS:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                text = resp.read().decode('utf-8', 'ignore')
+            if '#genre#' in text and len(text) > 1000:
+                print('已拉取订阅: %s（%d 字节）' % (url.split('/')[2], len(text)))
+                return text
+            print('内容异常，跳过: %s' % url)
+        except Exception as exc:  # noqa: BLE001
+            print('拉取失败 %s: %s' % (url.split('/')[2], exc))
+    return None
 
 
 def read_lines(path):
@@ -132,10 +155,9 @@ def build(base_lines, fallback=None):
 
 
 def main():
-    local_lines = read_lines(PATH)
-    if not local_lines:
-        raise SystemExit('未找到 live.txt')
+    offline = '--offline' in sys.argv
 
+    local_lines = read_lines(PATH)
     fallback = {}
     start, end = group_range(local_lines, TARGET_GROUP)
     for line in local_lines[start:end]:
@@ -143,7 +165,17 @@ def main():
             name, url = line.split(',', 1)
             fallback[name.strip()] = url
 
-    out, stats = build(local_lines, fallback)
+    base_lines, source = local_lines, '本地 live.txt'
+    if not offline:
+        text = fetch_upstream()
+        if text:
+            base_lines, source = text.replace('\r\n', '\n').split('\n'), '作者订阅'
+        else:
+            print('地址拉取失败，改用本地 live.txt')
+    if not base_lines:
+        raise SystemExit('没有可用的 live.txt 数据')
+
+    out, stats = build(base_lines, fallback)
 
     # 校验：结构完整才覆盖，避免把订阅写坏
     genre_count = sum(1 for l in out if '#genre#' in l)
@@ -157,6 +189,7 @@ def main():
     with io.open(PATH, 'w', encoding='utf-8', newline='') as f:
         f.write('\r\n'.join(out) + '\r\n')
 
+    print('数据来源: %s' % source)
     print('删除旧江苏地方分组: %s 行' % stats['old_target'])
     print('删除分组: %s' % ('、'.join('%s(%s行)' % (k, v) for k, v in stats['dropped'].items()) or '无'))
     print('其它河南频道: %s 行' % stats['henan'])
